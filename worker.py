@@ -42,6 +42,7 @@ import asyncpg
 import redis.asyncio as aredis
 
 from context import ContextBuilder
+from generator import Generator
 from episodes import Episodes
 
 STREAM = "hazshield:violations"
@@ -88,8 +89,10 @@ class Worker:
 
     async def run(self):
         pool = await asyncpg.create_pool(self.pg_dsn, min_size=1, max_size=4)
-        self.episodes = Episodes(pool, log, f, ContextBuilder(pool, log, f))
+        ctx = ContextBuilder(pool, log, f)
+        self.episodes = Episodes(pool, log, f, ctx)
         sweeper = asyncio.create_task(self.sweep_loop())
+        generator = asyncio.create_task(Generator(pool, ctx, log, f).loop(self.stop))
         r = aredis.from_url(self.redis_url, decode_responses=True,
                             socket_timeout=15, socket_connect_timeout=5)
         # Idempotent group creation. '0' = the group owns the ENTIRE
@@ -137,6 +140,7 @@ class Worker:
             await asyncio.sleep(2)
 
         sweeper.cancel()
+        generator.cancel()
         await pool.close()
         await r.aclose()
         log.info("drained and stopped", extra=f(processed=self.processed,

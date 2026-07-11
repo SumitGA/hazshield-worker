@@ -65,6 +65,14 @@ DO UPDATE SET
 RETURNING alarm_id, state, severity, n_readings, (xmax = 0) AS opened
 """
 
+# Which transitions warrant an isolation plan: an episode that is
+# critical from birth, or one that just escalated. Warn-only episodes
+# are watchlist items, not planning triggers.
+def needs_plan(opened: bool, state: str, severity: str, prev_state) -> bool:
+    if opened and severity == "critical":
+        return True
+    return state == "escalated" and prev_state != "escalated"
+
 SWEEP = """
 UPDATE alarm_events
 SET state = 'cleared', cleared_at = now()
@@ -74,7 +82,8 @@ RETURNING alarm_id, sensor_id, severity, peak_value, n_readings
 
 
 class Episodes:
-    def __init__(self, pool, log, f):
+    def __init__(self, pool, log, f, context_builder=None):
+        self.context = context_builder
         self.pool = pool
         self.log = log
         self.f = f
@@ -96,6 +105,8 @@ class Episodes:
                     parse_ts(v["ts"]), float(v["value"]))
 
         state, prev = row["state"], self._last_state.get(v["sensor_id"])
+        if self.context and needs_plan(row["opened"], state, row["severity"], prev):
+            await self.context.request_plan(row["alarm_id"])
         self._last_state[v["sensor_id"]] = state
         if row["opened"]:
             self.log.info("episode opened", extra=self.f(

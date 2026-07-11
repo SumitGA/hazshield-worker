@@ -1,0 +1,28 @@
+# /etc/systemd/system/hazshield-worker@.service
+# Template unit: run N workers as hazshield-worker@1, @2, ...
+# Each instance gets a stable consumer name -> restarts resume their
+# own pending entries; peers adopt them only after claim-idle expiry.
+[Unit]
+Description=HazShield alarm worker %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/hazshield-workers
+Environment=HAZ_REDIS_URL=redis://:CHANGE_ME@10.10.0.12:6379/0
+Environment=HAZ_CONSUMER=%H-w%i
+ExecStart=/opt/hazshield-workers/venv/bin/python3 worker.py
+Restart=on-failure
+RestartSec=3
+# same drain contract as the gateway:
+TimeoutStopSec=15
+KillSignal=SIGTERM
+MemoryMax=512M
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/hazshield-workers
+
+[Install]
+WantedBy=multi-user.target

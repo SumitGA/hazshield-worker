@@ -8,7 +8,7 @@ SHA=$(git rev-parse --short HEAD)
 [ -n "$(git status --porcelain)" ] && SHA="${SHA}-dirty" && echo "WARN: deploying dirty tree"
 
 # ship code + a version marker
-scp -q "$SRC"/*.py" "$HOST:$DEST/"
+scp -q "$SRC"/*.py "$SRC/requirements.txt" "$HOST:$DEST/"
 echo "$SHA" | ssh "$HOST" "cat > $DEST/VERSION"
 
 ssh "$HOST" "

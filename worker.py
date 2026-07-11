@@ -38,7 +38,10 @@ import socket
 import sys
 import time
 
+import asyncpg
 import redis.asyncio as aredis
+
+from episodes import Episodes
 
 STREAM = "hazshield:violations"
 GROUP = "hazshield:planners"
@@ -68,6 +71,8 @@ def f(**kw):  # structured-field helper: log.info("msg", extra=f(a=1))
 class Worker:
     def __init__(self):
         self.redis_url = os.environ.get("HAZ_REDIS_URL", "redis://127.0.0.1:6379/0")
+        self.pg_dsn = os.environ.get("HAZ_DATABASE_URL",
+                                     "postgresql://hazshield:devpw@127.0.0.1/hazshield")
         # Consumer name must be STABLE across restarts of the same unit:
         # a restarted worker resumes its own pending entries first.
         self.consumer = os.environ.get("HAZ_CONSUMER", socket.gethostname())
@@ -81,6 +86,9 @@ class Worker:
         self.by_severity = {"warn": 0, "critical": 0}
 
     async def run(self):
+        pool = await asyncpg.create_pool(self.pg_dsn, min_size=1, max_size=4)
+        self.episodes = Episodes(pool, log, f)
+        sweeper = asyncio.create_task(self.sweep_loop())
         r = aredis.from_url(self.redis_url, decode_responses=True,
                             socket_timeout=15, socket_connect_timeout=5)
         # Idempotent group creation. '0' = the group owns the ENTIRE
@@ -127,6 +135,8 @@ class Worker:
             log.warning("redis hiccup; retrying", extra=f(error=str(e)))
             await asyncio.sleep(2)
 
+        sweeper.cancel()
+        await pool.close()
         await r.aclose()
         log.info("drained and stopped", extra=f(processed=self.processed,
                                                 **self.by_severity))
@@ -135,9 +145,11 @@ class Worker:
         ids = []
         for entry_id, fields in entries:
             v = json.loads(fields["v"])
-            # --- Session 1 handler: observe and count. ---
-            # Session 2 replaces this with the episode state machine;
-            # everything around it (deliver/ack/reclaim) stays.
+            # The episode transition COMMITS (fsync'd, SET LOCAL sync
+            # commit) before this entry can be acked below. Crash after
+            # commit, before ack => redelivery => idempotent upsert.
+            # Order matters: durable first, then ack. Never the reverse.
+            await self.episodes.apply(v)
             self.by_severity[v["severity"]] = self.by_severity.get(v["severity"], 0) + 1
             self.processed += 1
             ids.append(entry_id)
@@ -155,6 +167,18 @@ class Worker:
         if self.processed % 500 == 0 or len(entries) < self.batch:
             log.info("progress", extra=f(processed=self.processed,
                                          **self.by_severity))
+
+
+    async def sweep_loop(self):
+        # Clearing is time-driven, not event-driven: run alongside
+        # consumption. Multiple workers sweeping is harmless — each
+        # quiet episode matches exactly one UPDATE.
+        while not self.stop.is_set():
+            try:
+                await self.episodes.sweep()
+            except Exception as e:
+                log.warning("sweep failed; retrying", extra=f(error=str(e)))
+            await asyncio.sleep(min(self.episodes.clear_after / 3, 10))
 
 
 def main():

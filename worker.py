@@ -47,6 +47,14 @@ from episodes import Episodes
 
 STREAM = "hazshield:violations"
 GROUP = "hazshield:planners"
+# Dead-letter stream: poison entries (unparseable, or repeatedly
+# crashing the handler) are quarantined here and ACKed away from the
+# main flow. Without this, ONE malformed entry = infinite redelivery:
+# handler raises -> batch never acks -> XAUTOCLAIM re-adopts -> raises
+# again, forever. The DLQ converts a wedge into a queue you inspect
+# at leisure (dlq.py). Alarms are precious; so is the consumer's
+# ability to move past one broken alarm to reach the next real one.
+DLQ = "hazshield:violations:dlq"
 
 log = logging.getLogger("worker")
 
@@ -85,6 +93,7 @@ class Worker:
         self.crash_after = int(os.environ.get("HAZ_CRASH_AFTER", "0"))
         self.stop = asyncio.Event()
         self.processed = 0
+        self.quarantined = 0
         self.by_severity = {"warn": 0, "critical": 0}
 
     async def run(self):
@@ -149,13 +158,26 @@ class Worker:
     async def process(self, r, entries):
         ids = []
         for entry_id, fields in entries:
-            v = json.loads(fields["v"])
-            # The episode transition COMMITS (fsync'd, SET LOCAL sync
-            # commit) before this entry can be acked below. Crash after
-            # commit, before ack => redelivery => idempotent upsert.
-            # Order matters: durable first, then ack. Never the reverse.
-            await self.episodes.apply(v)
-            self.by_severity[v["severity"]] = self.by_severity.get(v["severity"], 0) + 1
+            try:
+                v = json.loads(fields.get("v", ""))
+                # Episode transition COMMITS (fsync'd, SET LOCAL sync
+                # commit) before this entry is acked. Crash after
+                # commit, before ack => redelivery => idempotent upsert.
+                # Durable first, then ack. Never the reverse.
+                await self.episodes.apply(v)
+                self.by_severity[v["severity"]] = self.by_severity.get(v["severity"], 0) + 1
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+                # Poison: malformed shape. Quarantine + ack; do NOT let
+                # one bad entry wedge the whole partition. Infra errors
+                # (DB down) still raise and abort the batch un-acked —
+                # those SHOULD be retried; poison should not.
+                await r.xadd(DLQ, {"original_id": entry_id,
+                                   "error": f"{type(e).__name__}: {str(e)[:150]}",
+                                   "v": fields.get("v", "")},
+                             maxlen=10_000, approximate=True)
+                self.quarantined += 1
+                log.warning("poison entry quarantined to DLQ", extra=f(
+                    entry=entry_id, error=f"{type(e).__name__}: {str(e)[:80]}"))
             self.processed += 1
             ids.append(entry_id)
 

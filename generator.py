@@ -174,7 +174,7 @@ class Generator:
         except Exception as e:
             self.fail_count += 1
             self.log.error("generation failed", extra=self.f(
-                plan=str(plan_id)[:8], error=str(e)[:200],
+                plan=str(plan_id)[:8], error=f"{type(e)}: {str(e)[:180]}",
                 consecutive=self.fail_count))
             if self.fail_count >= self.breaker_threshold:
                 self.breaker_open_until = time.monotonic() + self.breaker_cooldown

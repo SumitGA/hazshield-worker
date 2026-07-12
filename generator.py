@@ -197,6 +197,7 @@ class Generator:
             async with s.post(f"{self.ollama_url}/api/generate",
                               json={"model": self.model, "prompt": prompt,
                                     "stream": False,
+                                    "format": "json",
                                     "options": {"temperature": 0.2}},
                               timeout=aiohttp.ClientTimeout(total=self.timeout)) as r:
                 r.raise_for_status()

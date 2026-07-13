@@ -12,7 +12,8 @@ Type=simple
 User=ubuntu
 WorkingDirectory=/opt/hazshield-workers
 Environment=HAZ_OLLAMA_URL=127.0.0.1:11434
-Environment=HAZ_MODEL=phi3:mini
+Environment=HAZ_MODEL=llama3:8b
+Environment=HAZ_GEN_TIMEOUT_S=300
 Environment=HAZ_DATABASE_URL=postgresql://hazshield:CHANGE_ME@10.10.0.12/hazshield
 Environment=HAZ_REDIS_URL=redis://:CHANGE_ME@10.10.0.12:6379/0
 Environment=HAZ_CONSUMER=%H-w%i

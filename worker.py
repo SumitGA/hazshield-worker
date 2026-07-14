@@ -44,6 +44,7 @@ import redis.asyncio as aredis
 from context import ContextBuilder
 from generator import Generator
 from episodes import Episodes
+import telemetry as tel
 
 STREAM = "hazshield:violations"
 GROUP = "hazshield:planners"
@@ -97,6 +98,8 @@ class Worker:
         self.by_severity = {"warn": 0, "critical": 0}
 
     async def run(self):
+        tel.init_tracing()
+        mport = tel.start_metrics_server()
         pool = await asyncpg.create_pool(self.pg_dsn, min_size=1, max_size=4)
         ctx = ContextBuilder(pool, log, f)
         self.episodes = Episodes(pool, log, f, ctx)
@@ -114,7 +117,8 @@ class Worker:
         except aredis.ResponseError as e:
             if "BUSYGROUP" not in str(e):
                 raise
-        log.info("worker up", extra=f(consumer=self.consumer, batch=self.batch))
+        log.info("worker up", extra=f(consumer=self.consumer, batch=self.batch,
+                                      metrics_port=mport))
 
         while not self.stop.is_set():
           # Transient Redis trouble must not kill the worker: log, pause,
@@ -160,12 +164,21 @@ class Worker:
         for entry_id, fields in entries:
             try:
                 v = json.loads(fields.get("v", ""))
-                # Episode transition COMMITS (fsync'd, SET LOCAL sync
-                # commit) before this entry is acked. Crash after
-                # commit, before ack => redelivery => idempotent upsert.
-                # Durable first, then ack. Never the reverse.
-                await self.episodes.apply(v)
+                # One span per violation: the root of the causal chain
+                # a viewer can follow gateway -> worker -> LLM. Child
+                # spans for the episode upsert and (if triggered) the
+                # plan generation attach under it automatically via the
+                # active-context mechanism.
+                with tel.span("violation.process",
+                              **{"haz.severity": v.get("severity", "?"),
+                                 "haz.sensor_kind": v.get("sensor_kind", "?")}):
+                    # Episode transition COMMITS (fsync'd, SET LOCAL sync
+                    # commit) before this entry is acked. Crash after
+                    # commit, before ack => redelivery => idempotent upsert.
+                    # Durable first, then ack. Never the reverse.
+                    await self.episodes.apply(v)
                 self.by_severity[v["severity"]] = self.by_severity.get(v["severity"], 0) + 1
+                tel.m_violation(v["severity"])
             except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
                 # Poison: malformed shape. Quarantine + ack; do NOT let
                 # one bad entry wedge the whole partition. Infra errors
@@ -176,6 +189,7 @@ class Worker:
                                    "v": fields.get("v", "")},
                              maxlen=10_000, approximate=True)
                 self.quarantined += 1
+                tel.m_quarantine()
                 log.warning("poison entry quarantined to DLQ", extra=f(
                     entry=entry_id, error=f"{type(e).__name__}: {str(e)[:80]}"))
             self.processed += 1
